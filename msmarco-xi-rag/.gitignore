@@ -1,0 +1,28 @@
+# Environment
+.env
+.env.*
+!.env.example
+frontend/.env.local
+frontend/.env.local.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Node
+node_modules/
+.next/
+out/
+
+# Logs and OS
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Benchmarks
+# benchmark result files containing secrets or private data

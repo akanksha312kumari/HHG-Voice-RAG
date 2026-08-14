@@ -1,0 +1,11 @@
+{
+  "description": "Placeholder for benchmark test queries",
+  "queries": [
+    {
+      "id": "q1",
+      "language": "hi-IN",
+      "text": "Placeholder test query",
+      "type": "easy_retrieval"
+    }
+  ]
+}
