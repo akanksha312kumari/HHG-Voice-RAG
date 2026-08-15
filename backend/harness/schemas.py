@@ -43,4 +43,5 @@ class PipelineResult(BaseModel):
     latency_breakdown: LatencyBreakdown
     model: str
     answer_source: str
+    error: Optional[str] = None
 

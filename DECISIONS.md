@@ -135,3 +135,16 @@ This document is the authoritative engineering decision log for the Voice RAG Sy
   - Mock latency **MUST NOT** be reported as measured Task 2 latency.
   - `USE_MOCK_DATA = false` is enforced for the real integration test path and production.
 * **Status**: IMPLEMENTED
+
+---
+
+### DEC-013: Retrieval Ranking Decision
+
+* **Decision**: Pinecone uses cosine similarity for vector search. The runtime retrieval queries use `include_values=False` and `include_metadata=True`. Therefore candidate vectors are not returned to the application.
+* **Implementation Details**: After the five concurrent strategy queries:
+  1. results are merged
+  2. results are deduplicated by passage_id
+  3. Pinecone's returned cosine similarity score is used for global ranking (Global score sort using Pinecone cosine similarity scores)
+  4. top-3 results are selected
+* **Context**: The runtime does not perform a second local vector cosine calculation and does not re-embed retrieved chunks for reranking. We explicitly avoid calling this "local cosine reranking" to maintain auditable architecture correctness.
+* **Status**: IMPLEMENTED
