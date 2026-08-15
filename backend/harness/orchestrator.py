@@ -29,7 +29,7 @@ async def run_pipeline(audio_data: bytes, lang: str) -> Dict[str, Any]:
 
     # 3. Embedding
     t0 = time.perf_counter()
-    query_embed = embedder.embed_text(transcript)
+    query_embed = await embedder.embed_query(transcript)
     latencies.embedding_ms = round((time.perf_counter() - t0) * 1000, 2)
 
     # 4. Off-Topic Check
@@ -39,33 +39,24 @@ async def run_pipeline(audio_data: bytes, lang: str) -> Dict[str, Any]:
     if is_off_topic:
         return _build_blocked_response(request_id, lang, transcript, detected_lang, latencies, "off_topic")
 
-    # 5. Concurrent Retrieval
+    # 5. Concurrent Retrieval, Merge, Dedupe, and Rerank
     t0 = time.perf_counter()
-    results = await asyncio.gather(
-        retriever.retrieve_by_embed(query_embed, lang, "P", 5),
-        retriever.retrieve_by_embed(query_embed, lang, "S", 5),
-        retriever.retrieve_by_embed(query_embed, lang, "W", 5),
-        retriever.retrieve_by_embed(query_embed, lang, "SM", 5),
-        retriever.retrieve_by_embed(query_embed, lang, "H", 5),
-    )
+    try:
+        # retrieve_ensemble handles the 5 concurrent strategy executions and returns the top 3 reranked chunks
+        top_chunks = await retriever.retrieve_ensemble(query_embed, lang)
+    except retriever.RetrievalUnavailableError:
+        latencies.retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return _build_error_response(request_id, lang, transcript, detected_lang, latencies, "retrieval_unavailable")
+        
     latencies.retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
+    latencies.rerank_ms = 0.0
 
-    # Flatten chunks
-    all_chunks = []
-    for strat_chunks in results:
-        all_chunks.extend(strat_chunks)
-
-    # 6. Rerank & Deduplicate
-    t0 = time.perf_counter()
-    top_chunks = retriever.rerank_and_dedupe(query_embed, all_chunks, top_k=3)
-    latencies.rerank_ms = round((time.perf_counter() - t0) * 1000, 2)
-
-    # 7. LLM Generation
+    # 6. LLM Generation
     t0 = time.perf_counter()
     answer_text, source = await generator.generate_answer(transcript, top_chunks)
     latencies.generation_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    # 8. Grounding Check
+    # 7. Grounding Check
     t0 = time.perf_counter()
     is_grounded = grounding.check_grounding(answer_text, top_chunks)
     latencies.grounding_ms = round((time.perf_counter() - t0) * 1000, 2)
@@ -106,3 +97,19 @@ def _build_blocked_response(req_id, lang, transcript, detected, latencies, reaso
     )
     return res.model_dump()
 
+
+def _build_error_response(req_id, lang, transcript, detected, latencies, error_code):
+    res = PipelineResult(
+        request_id=req_id,
+        language=lang,
+        transcript=transcript,
+        detected_lang=detected,
+        answer="",
+        retrieved_chunks=[],
+        guardrail=GuardrailResult(blocked=False, grounded=None),
+        latency_breakdown=latencies,
+        model="openai/gpt-oss-20b",
+        answer_source="infrastructure_failure",
+        error=error_code
+    )
+    return res.model_dump()

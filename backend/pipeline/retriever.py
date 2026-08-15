@@ -1,9 +1,14 @@
 """Retriever pipeline module."""
 import os
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Tuple
+import numpy as np
 from pinecone import AsyncPinecone
-from scipy.spatial.distance import cosine
+from backend.harness.schemas import RetrievedChunk
+
+class RetrievalUnavailableError(Exception):
+    """Domain-specific error raised when Pinecone infrastructure is completely unreachable."""
+    pass
 
 # Global pinecone client to avoid reconnect overhead
 pc = None
@@ -16,63 +21,101 @@ def _get_pinecone_index():
         if not api_key:
             return None
         pc = AsyncPinecone(api_key=api_key)
-        index = pc.IndexAsync(os.getenv("PINECONE_INDEX_NAME", "hhg-rag"))
+        # STRICT REQUIREMENT: Index must be exactly msmarco-xi
+        index = pc.IndexAsync("msmarco-xi")
     return index
 
-async def retrieve_by_embed(embed: List[float], lang: str, strategy: str, top_k: int = 5) -> List[Dict[str, Any]]:
+async def retrieve_by_embed(embed: np.ndarray, lang: str, strategy: str, top_k: int = 5) -> List[Tuple[RetrievedChunk, float]]:
     """
     Retrieve documents from the existing Pinecone index using the provided embedding.
-    Runs concurrently per strategy.
+    Returns a list of tuples containing (RetrievedChunk, score) to allow for later global score sorting.
     """
+    # 1. Validate vector shape matching exactly 384 dimensions
+    if embed.shape != (384,):
+        raise ValueError(f"Vector dimension mismatch: expected (384,), got {embed.shape}")
+        
     idx = _get_pinecone_index()
     if not idx:
-        print("WARNING: Pinecone credentials missing. Returning empty chunks.")
-        return []
+        raise RetrievalUnavailableError("Pinecone credentials missing. Infrastructure unreachable.")
     
-    try:
-        response = await idx.query(
-            vector=embed,
-            filter={"strategy": strategy, "language": lang},
-            top_k=top_k,
-            include_metadata=True
+    # Convert np.ndarray to list of floats for Pinecone API
+    vector = embed.tolist()
+    
+    response = await idx.query(
+        vector=vector,
+        filter={"strategy": {"$eq": strategy}, "lang": {"$eq": lang}},
+        top_k=top_k,
+        include_metadata=True,
+        include_values=False
+    )
+    
+    results = []
+    for match in response.matches:
+        chunk = RetrievedChunk(
+            text=match.metadata.get("text", ""),
+            strategy=strategy,
+            language=lang,
+            passage_id=match.metadata.get("passage_id", "")
         )
-        
-        results = []
-        for match in response.matches:
-            results.append({
-                "id": match.id,
-                "score": match.score,
-                "text": match.metadata.get("text", ""),
-                "strategy": strategy,
-                "language": lang,
-                "passage_id": match.metadata.get("passage_id", "")
-            })
-        return results
-    except Exception as e:
-        print(f"Pinecone Retrieval Error for strategy {strategy}: {e}")
-        return []
+        # We store Pinecone's returned similarity score (since metric="cosine") to use in the Global Score Sort
+        results.append((chunk, match.score))
+    return results
 
-def rerank_and_dedupe(query_embed: List[float], chunks: List[Dict[str, Any]], top_k: int = 3) -> List[Dict[str, Any]]:
+async def retrieve_ensemble(embed: np.ndarray, lang: str) -> List[RetrievedChunk]:
     """
-    Deduplicates the 25 retrieved chunks and re-ranks them based on Cosine Similarity.
+    Executes the 5 strategy queries concurrently.
+    If all 5 fail due to infrastructure issues, raises RetrievalUnavailableError.
+    Otherwise merges successful candidates, deduplicates, and performs Global Score Sort.
     """
-    unique_chunks = {}
-    for c in chunks:
-        # Use text as uniqueness key to deduplicate identical passages from different strategies
-        text = c["text"]
-        if text not in unique_chunks:
-            unique_chunks[text] = c
+    # 1. Execute five concurrent queries. return_exceptions=True isolates individual strategy failures
+    # without crashing the entire ensemble immediately.
+    results = await asyncio.gather(
+        retrieve_by_embed(embed, lang, "P", 5),
+        retrieve_by_embed(embed, lang, "S", 5),
+        retrieve_by_embed(embed, lang, "W", 5),
+        retrieve_by_embed(embed, lang, "SM", 5),
+        retrieve_by_embed(embed, lang, "H", 5),
+        return_exceptions=True
+    )
+    
+    # 2. Extract successful strategy results and trap complete outages
+    all_candidates: List[Tuple[RetrievedChunk, float]] = []
+    success_count = 0
+    for strat_results in results:
+        if isinstance(strat_results, Exception):
+            if isinstance(strat_results, RetrievalUnavailableError):
+                continue
+            print(f"Strategy retrieval encountered error: {strat_results}")
         else:
-            # If seen before, just keep the one with higher original vector score (or merge strategy labels)
-            if c.get("score", 0) > unique_chunks[text].get("score", 0):
-                unique_chunks[text] = c
+            success_count += 1
+            all_candidates.extend(strat_results)
+            
+    if success_count == 0:
+        raise RetrievalUnavailableError("All 5 retrieval strategies failed. Pinecone infrastructure is unreachable.")
+        
+    # 3. Deduplicate strictly by passage_id
+    unique_candidates = {}
+    for chunk, score in all_candidates:
+        pid = chunk.passage_id
+        # Fallback to text hash if passage_id is missing to avoid dropping valid distinct chunks
+        key = pid if pid else hash(chunk.text)
+        
+        if key not in unique_candidates:
+            unique_candidates[key] = (chunk, score)
+        else:
+            # If we've seen this passage before, retain the one with the highest similarity score
+            existing_chunk, existing_score = unique_candidates[key]
+            if score > existing_score:
+                unique_candidates[key] = (chunk, score)
 
-    deduped = list(unique_chunks.values())
+    deduped_candidates = list(unique_candidates.values())
     
-    # In a real environment, we might have embedding vectors attached to metadata, or we re-embed.
-    # Since we can't afford to re-embed 25 chunks inline (violates <200ms), we just sort by Pinecone score.
-    # The instructions say "cosine rerank", so assuming pinecone score is already cosine, sorting is fine.
+    # 4. Global Score Sort
+    # Because include_values=False, we intentionally do NOT have the raw candidate vectors 
+    # to run an in-process cosine computation. We rely strictly on Pinecone's returned metric score.
+    # We do NOT invent a second embedding path here to fake cosine reranking.
+    deduped_candidates.sort(key=lambda x: x[1], reverse=True)
     
-    deduped.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-    return deduped[:top_k]
-
+    # 5. Extract top 3 and strip the score tuple
+    top_3 = [chunk for chunk, score in deduped_candidates[:3]]
+    return top_3
