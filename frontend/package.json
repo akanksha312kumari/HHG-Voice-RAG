@@ -8,8 +8,18 @@
     "start": "next start"
   },
   "dependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "autoprefixer": "^10.5.4",
+    "lucide-react": "^1.31.0",
     "next": "latest",
+    "postcss": "^8.5.26",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "react-media-recorder": "^1.7.2",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2"
   }
 }
